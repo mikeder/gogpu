@@ -77,6 +77,13 @@ var (
 var mainThreadTasks chan func()
 
 func TestMain(m *testing.M) {
+	// Skip on CI - Metal is not available on GitHub Actions macOS runners
+	// due to Apple Virtualization Framework limitations.
+	// See: https://github.com/actions/runner-images/discussions/6138
+	if os.Getenv("CI") == "true" || os.Getenv("GITHUB_ACTIONS") == "true" {
+		os.Exit(0)
+	}
+
 	mainThreadTasks = make(chan func())
 	done := make(chan int, 1)
 
