@@ -18,10 +18,12 @@ const (
 	wmDestroy          = 0x0002
 	wmSize             = 0x0005
 	wmClose            = 0x0010
+	wmSetCursor        = 0x0020
 	wmEnterSizeMove    = 0x0231 // Start of resize/move modal loop
 	wmExitSizeMove     = 0x0232 // End of resize/move modal loop
 	wmKeydown          = 0x0100
 	wmKeyup            = 0x0101
+	htClient           = 1 // WM_SETCURSOR hit test code for client area
 	idcArrow           = 32512
 	swShowNormal       = 1
 	swShow             = 5
@@ -51,6 +53,7 @@ var (
 	procDefWindowProcW     = user32.NewProc("DefWindowProcW")
 	procPostQuitMessage    = user32.NewProc("PostQuitMessage")
 	procLoadCursorW        = user32.NewProc("LoadCursorW")
+	procSetCursor          = user32.NewProc("SetCursor")
 	procGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
 	procGetCurrentThreadID = kernel32.NewProc("GetCurrentThreadId")
 	procDestroyWindow      = user32.NewProc("DestroyWindow")
@@ -92,12 +95,14 @@ type rect struct {
 type windowsPlatform struct {
 	hwnd        windows.HWND
 	hinstance   windows.Handle
+	cursor      uintptr // Default arrow cursor for WM_SETCURSOR
 	width       int
 	height      int
 	shouldClose bool
 	inSizeMove  bool // True during modal resize/move loop
 	events      []Event
 	eventMu     sync.Mutex
+	sizeMu      sync.RWMutex // Protects width, height, inSizeMove for thread-safe access
 }
 
 // Global instance for window procedure callback
@@ -132,6 +137,7 @@ func (p *windowsPlatform) Init(config Config) error {
 	// Load default cursor
 	cursor, _, _ := procLoadCursorW.Call(0, uintptr(idcArrow))
 	wndClass.hCursor = windows.Handle(cursor)
+	p.cursor = cursor // Store for WM_SETCURSOR handling
 
 	ret, _, _ = procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wndClass)))
 	if ret == 0 {
@@ -180,8 +186,11 @@ func (p *windowsPlatform) Init(config Config) error {
 func (p *windowsPlatform) updateSize() {
 	var r rect
 	procGetClientRect.Call(uintptr(p.hwnd), uintptr(unsafe.Pointer(&r)))
+
+	p.sizeMu.Lock()
 	p.width = int(r.right - r.left)
 	p.height = int(r.bottom - r.top)
+	p.sizeMu.Unlock()
 }
 
 func (p *windowsPlatform) PollEvents() Event {
@@ -218,7 +227,18 @@ func (p *windowsPlatform) ShouldClose() bool {
 }
 
 func (p *windowsPlatform) GetSize() (width, height int) {
+	p.sizeMu.RLock()
+	defer p.sizeMu.RUnlock()
 	return p.width, p.height
+}
+
+// InSizeMove returns true if the window is in a modal resize/move loop.
+// During this time, rendering should continue but swapchain recreation
+// should be deferred to prevent hangs.
+func (p *windowsPlatform) InSizeMove() bool {
+	p.sizeMu.RLock()
+	defer p.sizeMu.RUnlock()
+	return p.inSizeMove
 }
 
 func (p *windowsPlatform) GetHandle() (instance, window uintptr) {
@@ -274,32 +294,44 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 	case wmSize:
 		newWidth := int(lParam & 0xFFFF)
 		newHeight := int((lParam >> 16) & 0xFFFF)
-		if newWidth > 0 && newHeight > 0 && (newWidth != p.width || newHeight != p.height) {
+
+		p.sizeMu.Lock()
+		sizeChanged := newWidth > 0 && newHeight > 0 && (newWidth != p.width || newHeight != p.height)
+		inSizeMove := p.inSizeMove
+		if sizeChanged {
 			p.width = newWidth
 			p.height = newHeight
-			// During modal resize loop, don't queue events - wait for WM_EXITSIZEMOVE
-			if !p.inSizeMove {
-				p.queueEvent(Event{
-					Type:   EventResize,
-					Width:  newWidth,
-					Height: newHeight,
-				})
-			}
+		}
+		p.sizeMu.Unlock()
+
+		// During modal resize loop, don't queue events - wait for WM_EXITSIZEMOVE
+		if sizeChanged && !inSizeMove {
+			p.queueEvent(Event{
+				Type:   EventResize,
+				Width:  newWidth,
+				Height: newHeight,
+			})
 		}
 		return 0
 
 	case wmEnterSizeMove:
+		p.sizeMu.Lock()
 		p.inSizeMove = true
+		p.sizeMu.Unlock()
 		return 0
 
 	case wmExitSizeMove:
+		p.sizeMu.Lock()
 		p.inSizeMove = false
+		p.sizeMu.Unlock()
+
 		// Queue final resize event when resize ends
 		p.updateSize()
+		width, height := p.GetSize()
 		p.queueEvent(Event{
 			Type:   EventResize,
-			Width:  p.width,
-			Height: p.height,
+			Width:  width,
+			Height: height,
 		})
 		return 0
 
@@ -310,6 +342,18 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 			p.queueEvent(Event{Type: EventClose})
 		}
 		return 0
+
+	case wmSetCursor:
+		// Restore cursor to arrow when in client area.
+		// This fixes resize cursor staying after resize ends.
+		hitTest := lParam & 0xFFFF
+		if hitTest == htClient {
+			_, _, _ = procSetCursor.Call(p.cursor)
+			return 1 // Cursor was set
+		}
+		// Let Windows handle non-client area cursors
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(message), wParam, lParam)
+		return ret
 	}
 
 	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(message), wParam, lParam)
