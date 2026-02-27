@@ -49,12 +49,17 @@ type WlSeat struct {
 
 // NewWlSeat creates a WlSeat from a bound object ID.
 // The objectID should be obtained from Registry.BindSeat().
+// It auto-registers with Display for event dispatch (capabilities, name events).
 func NewWlSeat(display *Display, objectID ObjectID, version uint32) *WlSeat {
-	return &WlSeat{
+	s := &WlSeat{
 		display: display,
 		id:      objectID,
 		version: version,
 	}
+	if display != nil {
+		display.RegisterObject(objectID, s)
+	}
+	return s
 }
 
 // ID returns the object ID of the seat.
@@ -350,11 +355,16 @@ type WlPointer struct {
 }
 
 // NewWlPointer creates a WlPointer from an object ID.
+// It auto-registers with Display for event dispatch (motion, button, axis events).
 func NewWlPointer(display *Display, objectID ObjectID) *WlPointer {
-	return &WlPointer{
+	p := &WlPointer{
 		display: display,
 		id:      objectID,
 	}
+	if display != nil {
+		display.RegisterObject(objectID, p)
+	}
+	return p
 }
 
 // ID returns the object ID of the pointer.
@@ -870,14 +880,19 @@ type WlKeyboard struct {
 }
 
 // NewWlKeyboard creates a WlKeyboard from an object ID.
+// It auto-registers with Display for event dispatch (keymap, key, modifiers events).
 func NewWlKeyboard(display *Display, objectID ObjectID) *WlKeyboard {
-	return &WlKeyboard{
+	k := &WlKeyboard{
 		display:     display,
 		id:          objectID,
 		keymapFD:    -1,
 		repeatRate:  25,  // Default: 25 chars/sec
 		repeatDelay: 400, // Default: 400ms
 	}
+	if display != nil {
+		display.RegisterObject(objectID, k)
+	}
+	return k
 }
 
 // ID returns the object ID of the keyboard.
@@ -1279,11 +1294,16 @@ type WlTouch struct {
 }
 
 // NewWlTouch creates a WlTouch from an object ID.
+// It auto-registers with Display for event dispatch (down, up, motion events).
 func NewWlTouch(display *Display, objectID ObjectID) *WlTouch {
-	return &WlTouch{
+	t := &WlTouch{
 		display: display,
 		id:      objectID,
 	}
+	if display != nil {
+		display.RegisterObject(objectID, t)
+	}
+	return t
 }
 
 // ID returns the object ID of the touch.

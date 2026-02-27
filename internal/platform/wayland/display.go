@@ -48,11 +48,18 @@ var (
 	ErrNoMessage           = errors.New("wayland: no message available")
 )
 
+// ObjectHandler is implemented by Wayland objects that receive events.
+// Objects register themselves with Display to receive event dispatch.
+type ObjectHandler interface {
+	dispatch(msg *Message) error
+}
+
 // Display represents a connection to the Wayland compositor.
 // It is always object ID 1 in the Wayland protocol.
 type Display struct {
 	conn     net.Conn
 	connFile *os.File
+	sockFd   int // raw socket fd, stored once to avoid os.File.Fd() blocking mode reset
 
 	// Object ID allocation
 	nextID atomic.Uint32
@@ -72,6 +79,9 @@ type Display struct {
 	// Event handlers
 	registry *Registry
 	onError  func(objectID ObjectID, code uint32, message string)
+
+	// Object dispatch routing — registered objects receive events
+	objects map[ObjectID]ObjectHandler
 
 	// Delete ID tracking
 	deletedIDs []ObjectID
@@ -112,13 +122,27 @@ func ConnectTo(socketPath string) (*Display, error) {
 		return nil, fmt.Errorf("wayland: failed to get socket file: %w", err)
 	}
 
+	// Store the raw fd ONCE. Go's os.File.Fd() puts the file into blocking mode
+	// every time it's called, so we must capture it once and use the stored value.
+	sockFd := int(file.Fd())
+
+	// Set non-blocking mode so Dispatch()/PollEvents can drain pending messages
+	// without blocking when no data is available (recvmsg returns EAGAIN).
+	if err := unix.SetNonblock(sockFd, true); err != nil {
+		_ = file.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("wayland: failed to set non-blocking: %w", err)
+	}
+
 	d := &Display{
 		conn:      conn,
 		connFile:  file,
+		sockFd:    sockFd,
 		readBuf:   make([]byte, maxMessageSize),
 		writeBuf:  make([]byte, 0, 4096),
 		fdBuf:     make([]int, 0, 16),
 		callbacks: make(map[ObjectID]chan uint32),
+		objects:   make(map[ObjectID]ObjectHandler),
 	}
 
 	// wl_display is always object ID 1, so start allocating from 2
@@ -214,7 +238,9 @@ func (d *Display) Roundtrip() error {
 		return err
 	}
 
-	// Read events until we get our callback
+	// Read events until we get our callback.
+	// Socket is non-blocking, so we use poll() to wait for new data.
+	// Must check pendingMsgs before waiting — the callback may already be buffered.
 	for {
 		if err := d.DispatchOne(); err != nil {
 			return err
@@ -227,9 +253,40 @@ func (d *Display) Roundtrip() error {
 			}
 			return nil
 		default:
-			// Continue reading
+			// Only wait for socket data if no buffered messages remain.
+			// The sync callback might be in pendingMsgs from a previous recvmsg batch.
+			if !d.hasPending() {
+				if err := d.waitReadable(5000); err != nil {
+					return err
+				}
+			}
 		}
 	}
+}
+
+// hasPending returns true if there are buffered messages from a previous recvmsg.
+func (d *Display) hasPending() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.pendingMsgs) > 0
+}
+
+// waitReadable blocks until the socket has data to read or timeout (ms) expires.
+// Uses poll() for efficient waiting on the non-blocking socket.
+func (d *Display) waitReadable(timeoutMs int) error {
+	fd := d.sockFd
+	pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, err := unix.Poll(pollFds, timeoutMs)
+	if err != nil {
+		if errors.Is(err, unix.EINTR) {
+			return nil // interrupted, retry
+		}
+		return fmt.Errorf("wayland: poll failed: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("wayland: roundtrip timeout")
+	}
+	return nil
 }
 
 // GetRegistry requests the global registry from the compositor.
@@ -285,7 +342,7 @@ func (d *Display) SendMessage(msg *Message) error {
 
 // sendWithFDs sends data with file descriptors via SCM_RIGHTS.
 func (d *Display) sendWithFDs(data []byte, fds []int) error {
-	fd := int(d.connFile.Fd())
+	fd := d.sockFd
 
 	// Build control message for SCM_RIGHTS
 	rights := unix.UnixRights(fds...)
@@ -315,7 +372,7 @@ func (d *Display) RecvMessage() (*Message, error) {
 		return nil, ErrDisplayNotConnected
 	}
 
-	fd := int(d.connFile.Fd())
+	fd := d.sockFd
 
 	// Prepare control message buffer for SCM_RIGHTS
 	// Each fd is 4 bytes, allow for up to 28 fds
@@ -351,12 +408,17 @@ func (d *Display) RecvMessage() (*Message, error) {
 	}
 	msg.FDs = fds
 
-	// Decode remaining messages and queue them
+	// Decode remaining messages and queue them.
+	// SOCK_STREAM may deliver multiple messages in one recvmsg().
+	// File descriptors from SCM_RIGHTS are shared across all messages in the batch —
+	// each message gets the full fd list so handlers can consume them via decoder.FD().
+	// This is safe because at most one event per batch carries fds (wl_keyboard.keymap).
 	for decoder.Remaining() >= headerSize {
 		extra, extraErr := decoder.DecodeMessage()
 		if extraErr != nil {
 			break
 		}
+		extra.FDs = fds
 		d.pendingMsgs = append(d.pendingMsgs, extra)
 	}
 
@@ -424,6 +486,15 @@ func (d *Display) dispatch(msg *Message) error {
 		// Check if it's a registry event
 		if d.registry != nil && msg.ObjectID == d.registry.id {
 			return d.registry.dispatch(msg)
+		}
+
+		// Check registered object handlers (xdg_wm_base, xdg_surface, xdg_toplevel, etc.)
+		d.mu.Lock()
+		handler, hasHandler := d.objects[msg.ObjectID]
+		d.mu.Unlock()
+
+		if hasHandler {
+			return handler.dispatch(msg)
 		}
 
 		// Unknown object - this is not necessarily an error
@@ -524,6 +595,21 @@ func (d *Display) Flush() error {
 	return nil
 }
 
+// RegisterObject registers an object handler for event dispatch.
+// Events sent to the given object ID will be routed to the handler.
+func (d *Display) RegisterObject(id ObjectID, handler ObjectHandler) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.objects[id] = handler
+}
+
+// UnregisterObject removes an object handler from event dispatch.
+func (d *Display) UnregisterObject(id ObjectID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.objects, id)
+}
+
 // DisplayID returns the object ID of the display (always 1).
 func (d *Display) DisplayID() ObjectID {
 	return 1
@@ -532,10 +618,7 @@ func (d *Display) DisplayID() ObjectID {
 // Fd returns the file descriptor of the socket connection.
 // This can be used with poll/epoll for event loop integration.
 func (d *Display) Fd() int {
-	if d.connFile == nil {
-		return -1
-	}
-	return int(d.connFile.Fd())
+	return d.sockFd
 }
 
 // Ptr returns the file descriptor as a uintptr for use with Vulkan surface creation.

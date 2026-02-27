@@ -23,7 +23,7 @@ type waylandPlatform struct {
 	// [0]=read, [1]=write. Created with O_NONBLOCK|O_CLOEXEC.
 	wakePipe [2]int
 
-	// Wayland core objects
+	// Wayland core objects (pure Go protocol)
 	display    *wayland.Display
 	registry   *wayland.Registry
 	compositor *wayland.WlCompositor
@@ -31,6 +31,14 @@ type waylandPlatform struct {
 	xdgWmBase  *wayland.XdgWmBase
 	xdgSurface *wayland.XdgSurface
 	toplevel   *wayland.XdgToplevel
+
+	// C pointers from libwayland-client for Vulkan surface creation.
+	// nil if libwayland-client.so.0 is unavailable (software backend fallback).
+	libwl *wayland.LibwaylandHandle
+
+	// Decorations (optional, zxdg_decoration_manager_v1)
+	decorationManager  *wayland.ZxdgDecorationManager
+	toplevelDecoration *wayland.ZxdgToplevelDecoration
 
 	// Input devices
 	seat     *wayland.WlSeat
@@ -214,9 +222,17 @@ func (p *x11Platform) WakeUp() {
 func (p *waylandPlatform) Init(config Config) error {
 	// Check if Wayland is available
 	if os.Getenv("WAYLAND_DISPLAY") == "" {
-		return fmt.Errorf("wayland: WAYLAND_DISPLAY not set (X11 not yet supported)")
+		return fmt.Errorf("wayland: WAYLAND_DISPLAY not set")
 	}
 
+	return p.initPureGoDisplay(config)
+}
+
+// initPureGoDisplay initializes using pure Go Wayland protocol.
+// After creating the window, tries to load libwayland-client.so.0 via goffi
+// to get real C pointers (wl_display*, wl_surface*) for Vulkan surface creation.
+// If unavailable, software backend is used instead.
+func (p *waylandPlatform) initPureGoDisplay(config Config) error {
 	// Connect to Wayland display
 	display, err := wayland.Connect()
 	if err != nil {
@@ -250,8 +266,15 @@ func (p *waylandPlatform) Init(config Config) error {
 	}
 	p.compositor = wayland.NewWlCompositor(display, compositorID)
 
-	// Bind to xdg_wm_base
-	xdgWmBaseID, err := registry.BindXdgWmBase(2)
+	// Bind to xdg_wm_base (use available version, max 2)
+	xdgVersion := registry.GlobalVersion(wayland.InterfaceXdgWmBase)
+	if xdgVersion > 2 {
+		xdgVersion = 2
+	}
+	if xdgVersion == 0 {
+		xdgVersion = 1
+	}
+	xdgWmBaseID, err := registry.BindXdgWmBase(xdgVersion)
 	if err != nil {
 		_ = display.Close()
 		return fmt.Errorf("wayland: failed to bind xdg_wm_base: %w", err)
@@ -308,6 +331,23 @@ func (p *waylandPlatform) Init(config Config) error {
 		}
 	}
 
+	// Request server-side decorations if compositor supports it
+	if registry.HasGlobal(wayland.InterfaceZxdgDecorationManagerV1) {
+		logger().Info("zxdg_decoration_manager_v1 found in pure Go registry")
+		decorMgrID, err := registry.BindZxdgDecorationManager(1)
+		if err == nil {
+			p.decorationManager = wayland.NewZxdgDecorationManager(display, decorMgrID)
+			decoration, err := p.decorationManager.GetToplevelDecoration(toplevel)
+			if err == nil {
+				p.toplevelDecoration = decoration
+				_ = decoration.SetMode(wayland.DecorationModeServerSide)
+				logger().Info("pure Go: server-side decorations requested")
+			}
+		}
+	} else {
+		logger().Info("zxdg_decoration_manager_v1 NOT found in registry")
+	}
+
 	// Set up event handlers
 	p.setupEventHandlers()
 
@@ -339,7 +379,52 @@ func (p *waylandPlatform) Init(config Config) error {
 		_ = toplevel.SetFullscreen(0) // Non-fatal, continue
 	}
 
+	// Try loading libwayland-client for Vulkan surface support.
+	p.tryLoadLibwayland(config)
+
 	return nil
+}
+
+// tryLoadLibwayland attempts to load libwayland-client.so.0 via goffi for Vulkan surface support.
+// Non-fatal: if unavailable, software backend is used (same pattern as X11/libX11).
+func (p *waylandPlatform) tryLoadLibwayland(config Config) {
+	compGlobal := p.registry.GetGlobalByInterface(wayland.InterfaceWlCompositor)
+	xdgGlobal := p.registry.GetGlobalByInterface(wayland.InterfaceXdgWmBase)
+	if compGlobal == nil || xdgGlobal == nil {
+		logger().Warn("wl_compositor or xdg_wm_base not found in registry, Vulkan surface unavailable")
+		return
+	}
+
+	// Get decoration manager global (optional — 0 means not available)
+	var decorName, decorVersion uint32
+	decorGlobal := p.registry.GetGlobalByInterface(wayland.InterfaceZxdgDecorationManagerV1)
+	if decorGlobal != nil {
+		decorName = decorGlobal.Name
+		decorVersion = decorGlobal.Version
+		logger().Info("libwayland: decoration manager global found",
+			"name", decorName, "version", decorVersion)
+	} else {
+		logger().Info("libwayland: decoration manager global NOT found")
+	}
+
+	libwl, err := wayland.OpenLibwayland(
+		compGlobal.Name, compGlobal.Version,
+		xdgGlobal.Name, xdgGlobal.Version,
+		decorName, decorVersion,
+	)
+	if err != nil {
+		logger().Warn("libwayland-client not available, using software backend", "error", err)
+		return
+	}
+	p.libwl = libwl
+
+	// Set title and app_id on the C xdg_toplevel (shown in decoration bar)
+	libwl.SetTitle(config.Title)
+	libwl.SetAppID("gogpu")
+
+	logger().Info("Vulkan surface ready via libwayland-client",
+		"display", fmt.Sprintf("%#x", libwl.Display()),
+		"surface", fmt.Sprintf("%#x", libwl.Surface()))
 }
 
 // setupEventHandlers sets up Wayland event handlers.
@@ -1245,6 +1330,7 @@ func (p *waylandPlatform) PollEvents() Event {
 	// Dispatch pending Wayland events (non-blocking)
 	if err := p.display.Dispatch(); err != nil {
 		// Connection error - treat as close
+		logger().Error("wayland dispatch error", "error", err)
 		p.mu.Lock()
 		p.shouldClose = true
 		p.mu.Unlock()
@@ -1288,18 +1374,13 @@ func (p *waylandPlatform) GetSize() (width, height int) {
 }
 
 // GetHandle returns platform-specific handles for Vulkan surface creation.
-// On Linux/Wayland, returns (wl_display fd, wl_surface id).
-// Note: For VK_KHR_wayland_surface, you need the actual C pointers.
-// This pure Go implementation provides the underlying IDs/FDs.
+// Returns (wl_display*, wl_surface*) from libwayland-client if available.
+// Returns (0, 0) if libwayland-client was not loaded (software backend fallback).
 func (p *waylandPlatform) GetHandle() (instance, window uintptr) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.display == nil || p.surface == nil {
-		return 0, 0
+	if p.libwl != nil {
+		return p.libwl.Display(), p.libwl.Surface()
 	}
-
-	return p.display.Ptr(), p.surface.Ptr()
+	return 0, 0
 }
 
 // Destroy closes the window and releases resources.
@@ -1314,7 +1395,13 @@ func (p *waylandPlatform) Destroy() {
 		p.wakePipe = [2]int{}
 	}
 
-	// Destroy in reverse order of creation
+	// Close libwayland-client C connection (Vulkan surface handle)
+	if p.libwl != nil {
+		p.libwl.Close()
+		p.libwl = nil
+	}
+
+	// Destroy pure Go objects in reverse order of creation
 
 	if p.touch != nil {
 		_ = p.touch.Release()
@@ -1334,6 +1421,16 @@ func (p *waylandPlatform) Destroy() {
 	if p.seat != nil {
 		// Don't call Release() unless we have version 5+
 		p.seat = nil
+	}
+
+	if p.toplevelDecoration != nil {
+		_ = p.toplevelDecoration.Destroy()
+		p.toplevelDecoration = nil
+	}
+
+	if p.decorationManager != nil {
+		_ = p.decorationManager.Destroy()
+		p.decorationManager = nil
 	}
 
 	if p.toplevel != nil {
@@ -1408,7 +1505,6 @@ func (p *waylandPlatform) WaitEvents() {
 		{Fd: int32(p.wakePipe[0]), Events: unix.POLLIN},
 	}
 	// Block indefinitely until an event arrives or WakeUp is called.
-	// EINTR from signal delivery is harmless — returns as spurious wakeup.
 	_, _ = unix.Poll(fds, -1)
 
 	// Drain the wakeup pipe so it is ready for the next WakeUp call.

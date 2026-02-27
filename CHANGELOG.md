@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-02-27
+
+### Added
+
+- **Wayland Vulkan surface via libwayland-client** — loads `libwayland-client.so.0` dynamically
+  via goffi to create real C pointers (`wl_display*`, `wl_surface*`) required by
+  `VK_KHR_wayland_surface`. Sets up xdg-shell role (`xdg_surface` + `xdg_toplevel`) with goffi
+  callbacks for configure/ping events. Without a role, the compositor won't composite the surface
+  and `vkQueuePresentKHR` blocks forever. Falls back to software backend if libwayland-client
+  is unavailable.
+- **Wayland server-side decorations** — requests window decorations (title bar, close/minimize/maximize
+  buttons) from the compositor via `zxdg_decoration_manager_v1` protocol on both pure Go and
+  libwayland-client connections. Sets window title and app_id on the C `xdg_toplevel` for
+  decoration bar display. Falls back gracefully if the compositor does not support this extension.
+
+### Fixed
+
+- **Wayland non-blocking socket** — fixed fd propagation for multi-message batches. The Wayland
+  socket now uses non-blocking I/O to prevent blocking when the compositor sends multiple events
+  in a single batch.
+
+### Changed
+
+- **Pure Go Wayland protocol refactored** — object dispatch architecture replaces monolithic
+  message handling. Each Wayland object type (compositor, surface, seat, keyboard, pointer, touch,
+  xdg_wm_base, xdg_surface, xdg_toplevel) has its own dispatch method.
+
+### Dependencies
+
+- wgpu v0.16.17 → v0.17.0 (Wayland Vulkan surface creation)
+- goffi v0.3.9 → v0.4.0 (crosscall2 callback support from any thread)
+- webgpu v0.3.2 → v0.4.0 (FFI null handle guards, go vet cleanup, WGPU_NATIVE_PATH)
+
 ## [0.20.9] - 2026-02-26
 
 ### Dependencies
