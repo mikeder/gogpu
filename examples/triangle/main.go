@@ -8,12 +8,18 @@ package main
 
 import (
 	"log"
+	"log/slog"
+	"os"
 
 	"github.com/gogpu/gogpu"
 	"github.com/gogpu/gogpu/gmath"
 )
 
 func main() {
+	gogpu.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
+
 	// Create application with simple configuration
 	app := gogpu.NewApp(gogpu.DefaultConfig().
 		WithTitle("GoGPU - Triangle Example").
