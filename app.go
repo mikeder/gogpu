@@ -148,6 +148,7 @@ func (a *App) Run() error {
 		Height:     a.config.Height,
 		Resizable:  a.config.Resizable,
 		Fullscreen: a.config.Fullscreen,
+		Frameless:  a.config.Frameless,
 	}); err != nil {
 		return err
 	}
@@ -184,7 +185,7 @@ func (a *App) Run() error {
 	// Initialize renderer on render thread (all GPU operations must be on same thread)
 	var initErr error
 	a.renderLoop.RunOnRenderThreadVoid(func() {
-		a.renderer, initErr = newRenderer(a.platform, a.config.Backend, a.config.GraphicsAPI)
+		a.renderer, initErr = newRenderer(a.platform, a.config.Backend, a.config.GraphicsAPI, a.config.VSync)
 	})
 	if initErr != nil {
 		return initErr
@@ -243,6 +244,13 @@ func (a *App) Run() error {
 		now := time.Now()
 		deltaTime := now.Sub(a.lastFrame).Seconds()
 		a.lastFrame = now
+
+		// Clamp deltaTime after long idle (WaitEvents can block for seconds/minutes).
+		// Without clamping, physics and animations would jump on the first frame.
+		// 66ms = ~15 FPS minimum, a safe upper bound for a single frame step.
+		if deltaTime > 0.066 {
+			deltaTime = 0.066
+		}
 
 		// Update input state for next frame (Ebiten-style polling)
 		// This must be called before onUpdate so JustPressed/JustReleased work correctly
@@ -367,6 +375,11 @@ func (a *App) modalFrameTick() {
 	deltaTime := now.Sub(a.lastFrame).Seconds()
 	a.lastFrame = now
 
+	// Clamp deltaTime after long idle (same as main loop).
+	if deltaTime > 0.066 {
+		deltaTime = 0.066
+	}
+
 	// Update input state
 	if a.inputState != nil {
 		a.inputState.Update()
@@ -387,6 +400,11 @@ func (a *App) modalFrameTick() {
 
 	// Render frame on render thread (blocks until complete).
 	a.renderFrameMultiThread()
+
+	// Synchronize with compositor (DwmFlush on Windows).
+	// This ensures our frame and the DWM window border update
+	// appear in the same composition cycle, reducing resize lag.
+	a.platform.SyncFrame()
 }
 
 // Quit requests the application to quit.
@@ -504,9 +522,73 @@ func (a *App) FontScale() float32 {
 	return 1.0
 }
 
+// SetFrameless enables or disables frameless window mode.
+// Implements gpucontext.WindowChrome.
+func (a *App) SetFrameless(frameless bool) {
+	if a.platform != nil {
+		a.platform.SetFrameless(frameless)
+	}
+}
+
+// IsFrameless returns true if the window is in frameless mode.
+// Implements gpucontext.WindowChrome.
+func (a *App) IsFrameless() bool {
+	if a.platform != nil {
+		return a.platform.IsFrameless()
+	}
+	return false
+}
+
+// SetHitTestCallback sets the callback for custom hit testing in frameless mode.
+// Implements gpucontext.WindowChrome.
+func (a *App) SetHitTestCallback(callback gpucontext.HitTestCallback) {
+	if a.platform != nil {
+		a.platform.SetHitTestCallback(func(x, y float64) gpucontext.HitTestResult {
+			if callback != nil {
+				return callback(x, y)
+			}
+			return gpucontext.HitTestClient
+		})
+	}
+}
+
+// Minimize minimizes the window.
+// Implements gpucontext.WindowChrome.
+func (a *App) Minimize() {
+	if a.platform != nil {
+		a.platform.Minimize()
+	}
+}
+
+// Maximize toggles between maximized and restored window state.
+// Implements gpucontext.WindowChrome.
+func (a *App) Maximize() {
+	if a.platform != nil {
+		a.platform.Maximize()
+	}
+}
+
+// IsMaximized returns true if the window is maximized.
+// Implements gpucontext.WindowChrome.
+func (a *App) IsMaximized() bool {
+	if a.platform != nil {
+		return a.platform.IsMaximized()
+	}
+	return false
+}
+
+// Close requests the window to close.
+// Implements gpucontext.WindowChrome.
+func (a *App) Close() {
+	if a.platform != nil {
+		a.platform.CloseWindow()
+	}
+}
+
 // Compile-time interface checks.
 var _ gpucontext.WindowProvider = (*App)(nil)
 var _ gpucontext.PlatformProvider = (*App)(nil)
+var _ gpucontext.WindowChrome = (*App)(nil)
 
 // Config returns the application configuration.
 func (a *App) Config() Config {

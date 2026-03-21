@@ -150,6 +150,49 @@ const (
 	spiGetHighContrast        = 0x0042
 	hcfHighContrastOn         = 0x00000001
 
+	// Frameless window constants
+	wsPopup            = 0x80000000 // WS_POPUP
+	wsThickFrame       = 0x00040000 // WS_THICKFRAME (for resize in frameless)
+	wsCaption          = 0x00C00000 // WS_CAPTION (title bar)
+	wmNCHitTest        = 0x0084     // WM_NCHITTEST
+	wmNCCalcSize       = 0x0083     // WM_NCCALCSIZE
+	wmNCPaint          = 0x0085     // WM_NCPAINT
+	wmNCActivate       = 0x0086     // WM_NCACTIVATE
+	wmNCUAHDrawCaption = 0x00AE     // Undocumented: UxTheme caption draw
+	wmNCUAHDrawFrame   = 0x00AF     // Undocumented: UxTheme frame draw
+	swMinimize         = 6          // SW_MINIMIZE
+	swMaximize         = 3          // SW_MAXIMIZE
+
+	// WM_NCHITTEST return values
+	htCaption     = 2
+	htSysMenu     = 3
+	htMinButton   = 8
+	htMaxButton   = 9
+	htClose       = 20 // HTCLOSE
+	htTop         = 12
+	htBottom      = 15
+	htLeft        = 10
+	htRight       = 11
+	htTopLeft     = 13
+	htTopRight    = 14
+	htBottomLeft  = 16
+	htBottomRight = 17
+
+	// SetWindowPos constants
+	swpNoMove       = 0x0002
+	swpNoSize       = 0x0001
+	swpNoZOrder     = 0x0004
+	swpFrameChanged = 0x0020
+
+	// GetSystemMetrics / MonitorFromWindow constants
+	smCXSizeFrame           = 32 // SM_CXSIZEFRAME
+	smCYSizeFrame           = 33 // SM_CYSIZEFRAME
+	smCXPaddedBorder        = 92 // SM_CXPADDEDBORDERWIDTH
+	monitorDefaultToNearest = 2  // MONITOR_DEFAULTTONEAREST
+
+	// DPI change message (Windows 8.1+)
+	wmDpiChanged = 0x02E0 // WM_DPICHANGED
+
 	// WaitEvents / WakeUp constants
 	wmWakeUp       = 0x0401     // WM_USER + 1 (custom wakeup message)
 	qsAllinput     = 0x04FF     // QS_ALLINPUT
@@ -198,6 +241,19 @@ var (
 	procGetMessageTime     = user32.NewProc("GetMessageTime")
 	procSetTimer           = user32.NewProc("SetTimer")
 	procKillTimer          = user32.NewProc("KillTimer")
+	procSetWindowLongPtrW  = user32.NewProc("SetWindowLongPtrW")
+	procSetWindowPos       = user32.NewProc("SetWindowPos")
+	procIsZoomed           = user32.NewProc("IsZoomed")
+	procScreenToClient     = user32.NewProc("ScreenToClient")
+	procInvalidateRect     = user32.NewProc("InvalidateRect")
+	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
+	procMonitorFromWindow  = user32.NewProc("MonitorFromWindow")
+	procGetMonitorInfoW    = user32.NewProc("GetMonitorInfoW")
+
+	// DWM (Desktop Window Manager) for frameless window shadow
+	dwmapi                       = windows.NewLazyDLL("dwmapi.dll")
+	procDwmExtendFrameIntoClient = dwmapi.NewProc("DwmExtendFrameIntoClientArea")
+	procDwmFlush                 = dwmapi.NewProc("DwmFlush")
 
 	// WaitEvents / WakeUp
 	procMsgWaitForMultipleObjectsEx = user32.NewProc("MsgWaitForMultipleObjectsEx")
@@ -216,6 +272,10 @@ var (
 	procGlobalLock       = kernel32.NewProc("GlobalLock")
 	procGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
 	procGlobalFree       = kernel32.NewProc("GlobalFree")
+
+	// Mouse capture (for drag tracking across window boundaries)
+	procSetCapture     = user32.NewProc("SetCapture")
+	procReleaseCapture = user32.NewProc("ReleaseCapture")
 
 	// Pointer input (WM_POINTER*, Windows 8+)
 	procGetPointerType    = user32.NewProc("GetPointerType")
@@ -236,6 +296,7 @@ var (
 	procGetDC             = user32.NewProc("GetDC")
 	procReleaseDC         = user32.NewProc("ReleaseDC")
 	procSetDIBitsToDevice = gdi32.NewProc("SetDIBitsToDevice")
+	procGetStockObject    = gdi32.NewProc("GetStockObject")
 )
 
 // trackMouseEventStruct is the TRACKMOUSEEVENT structure.
@@ -349,6 +410,11 @@ type windowsPlatform struct {
 	mouseInWindow bool
 	mouseMu       sync.RWMutex // Protects mouse state
 
+	// Frameless window state
+	frameless       bool
+	hitTestCallback func(x, y float64) gpucontext.HitTestResult
+	maximized       bool
+
 	// Callbacks for pointer, scroll, keyboard, and character input events
 	pointerCallback    func(gpucontext.PointerEvent)
 	scrollCallback     func(gpucontext.ScrollEvent)
@@ -393,6 +459,12 @@ func (p *windowsPlatform) Init(config Config) error {
 		lpszClassName: className,
 	}
 
+	// Set black background brush to prevent gray flash during resize/focus loss.
+	// Without this, Windows draws the system default background (gray) between
+	// GPU frame renders, causing visible flicker.
+	blackBrush, _, _ := procGetStockObject.Call(4) // BLACK_BRUSH = 4
+	wndClass.hbrBackground = windows.Handle(blackBrush)
+
 	// Load default cursor
 	cursor, _, _ := procLoadCursorW.Call(0, uintptr(idcArrow))
 	wndClass.hCursor = windows.Handle(cursor)
@@ -409,7 +481,16 @@ func (p *windowsPlatform) Init(config Config) error {
 		return fmt.Errorf("utf16 title: %w", err)
 	}
 
-	style := uintptr(wsOverlappedWindow | wsVisible)
+	// Both frameless and normal use WS_OVERLAPPEDWINDOW for native resize + DWM shadow.
+	// For frameless: WM_NCCALCSIZE removes title bar, WM_NCACTIVATE(-1) prevents
+	// border repaint, WM_NCUAHDRAW* blocks UxTheme painting.
+	var style uintptr
+	if config.Frameless {
+		// Create hidden — show after DWM setup + WM_NCCALCSIZE to avoid first-frame artifact.
+		style = uintptr(wsOverlappedWindow)
+	} else {
+		style = uintptr(wsOverlappedWindow | wsVisible)
+	}
 
 	hwnd, _, _ := procCreateWindowExW.Call(
 		0,
@@ -431,8 +512,23 @@ func (p *windowsPlatform) Init(config Config) error {
 	p.hwnd = windows.HWND(hwnd)
 	p.width = config.Width
 	p.height = config.Height
+	p.frameless = config.Frameless
 
-	// Show window
+	// Enable DWM shadow for frameless windows.
+	if config.Frameless {
+		type margins struct {
+			cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight int32
+		}
+		m := margins{0, 0, 0, 1}
+		procDwmExtendFrameIntoClient.Call(uintptr(p.hwnd), uintptr(unsafe.Pointer(&m)))
+		// Force WM_NCCALCSIZE to remove NC area, then update cached size
+		// so first frame renders at full window size.
+		procSetWindowPos.Call(uintptr(p.hwnd), 0, 0, 0, 0, 0,
+			swpNoMove|swpNoSize|swpNoZOrder|swpFrameChanged)
+		p.updateSize()
+	}
+
+	// Show window (frameless was created hidden to avoid first-frame artifact)
 	procShowWindow.Call(uintptr(p.hwnd), swShowNormal)
 	procUpdateWindow.Call(uintptr(p.hwnd))
 
@@ -614,7 +710,6 @@ func (p *windowsPlatform) ScaleFactor() float64 {
 }
 
 // PrepareFrame returns current DPI state for the Windows platform.
-// Future: apply pending WM_DPICHANGED here.
 func (p *windowsPlatform) PrepareFrame() PrepareFrameResult {
 	w, h := p.PhysicalSize()
 	return PrepareFrameResult{
@@ -819,6 +914,73 @@ func (p *windowsPlatform) HighContrast() bool {
 // On Windows, font scale is derived from the DPI scale factor.
 func (p *windowsPlatform) FontScale() float32 {
 	return float32(p.ScaleFactor())
+}
+
+func (p *windowsPlatform) SetFrameless(frameless bool) {
+	p.callbackMu.Lock()
+	p.frameless = frameless
+	p.callbackMu.Unlock()
+
+	// Style is always WS_OVERLAPPEDWINDOW (Chrome approach).
+	// WM_NCCALCSIZE removes the title bar when frameless=true.
+	// Toggle DWM frame extension for shadow.
+	type margins struct {
+		cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight int32
+	}
+	var m margins
+	if frameless {
+		m = margins{0, 0, 0, 1} // 1px bottom = enable DWM shadow
+	}
+	procDwmExtendFrameIntoClient.Call(uintptr(p.hwnd), uintptr(unsafe.Pointer(&m)))
+
+	// Force WM_NCCALCSIZE recalculation
+	procSetWindowPos.Call(uintptr(p.hwnd), 0, 0, 0, 0, 0,
+		swpNoMove|swpNoSize|swpNoZOrder|swpFrameChanged)
+}
+
+func (p *windowsPlatform) IsFrameless() bool {
+	p.callbackMu.RLock()
+	defer p.callbackMu.RUnlock()
+	return p.frameless
+}
+
+func (p *windowsPlatform) SetHitTestCallback(fn func(x, y float64) gpucontext.HitTestResult) {
+	p.callbackMu.Lock()
+	defer p.callbackMu.Unlock()
+	p.hitTestCallback = fn
+}
+
+func (p *windowsPlatform) SyncFrame() {
+	// DwmFlush synchronizes with Desktop Window Manager composition.
+	// During resize, this ensures our rendered frame and the DWM window
+	// border update appear in the same composition cycle, reducing lag.
+	p.sizeMu.RLock()
+	resizing := p.inSizeMove
+	p.sizeMu.RUnlock()
+	if resizing {
+		procDwmFlush.Call()
+	}
+}
+
+func (p *windowsPlatform) Minimize() {
+	procShowWindow.Call(uintptr(p.hwnd), swMinimize)
+}
+
+func (p *windowsPlatform) Maximize() {
+	if p.IsMaximized() {
+		procShowWindow.Call(uintptr(p.hwnd), swRestore)
+	} else {
+		procShowWindow.Call(uintptr(p.hwnd), swMaximize)
+	}
+}
+
+func (p *windowsPlatform) IsMaximized() bool {
+	ret, _, _ := procIsZoomed.Call(uintptr(p.hwnd))
+	return ret != 0
+}
+
+func (p *windowsPlatform) CloseWindow() {
+	procPostMessageW.Call(uintptr(p.hwnd), wmClose, 0, 0)
 }
 
 func (p *windowsPlatform) queueEvent(event Event) {
@@ -1317,9 +1479,71 @@ func (p *windowsPlatform) createPointerEvent(
 	}
 }
 
+// mouseCapture calls SetCapture on the first button press to track mouse
+// movement outside the window boundary during drag operations (sliders,
+// scrollbars, text selection). Must be called BEFORE dispatching the event
+// so the button state in p.buttons reflects the pre-press state.
+func (p *windowsPlatform) mouseCapture(wParam uintptr) {
+	p.mouseMu.Lock()
+	wasPressedBefore := p.buttons != gpucontext.ButtonsNone
+	p.buttons = extractButtons(wParam)
+	p.mouseMu.Unlock()
+
+	if !wasPressedBefore {
+		procSetCapture.Call(uintptr(p.hwnd))
+	}
+}
+
+// mouseRelease calls ReleaseCapture when the last button is released.
+// Must be called AFTER dispatching the event so the PointerUp event
+// still has correct button state.
+func (p *windowsPlatform) mouseRelease(wParam uintptr) {
+	newButtons := extractButtons(wParam)
+
+	p.mouseMu.Lock()
+	p.buttons = newButtons
+	p.mouseMu.Unlock()
+
+	if newButtons == gpucontext.ButtonsNone {
+		procReleaseCapture.Call()
+	}
+}
+
 // getPointerID extracts pointer ID from wParam (LOWORD).
 func getPointerID(wParam uintptr) uint32 {
 	return uint32(wParam & 0xFFFF)
+}
+
+// hitTestResultToWin32 converts gpucontext.HitTestResult to Win32 NCHITTEST values.
+func hitTestResultToWin32(result gpucontext.HitTestResult) uintptr {
+	switch result {
+	case gpucontext.HitTestCaption:
+		return htCaption
+	case gpucontext.HitTestClose:
+		return htClose
+	case gpucontext.HitTestMaximize:
+		return htMaxButton
+	case gpucontext.HitTestMinimize:
+		return htMinButton
+	case gpucontext.HitTestResizeN:
+		return htTop
+	case gpucontext.HitTestResizeS:
+		return htBottom
+	case gpucontext.HitTestResizeW:
+		return htLeft
+	case gpucontext.HitTestResizeE:
+		return htRight
+	case gpucontext.HitTestResizeNW:
+		return htTopLeft
+	case gpucontext.HitTestResizeNE:
+		return htTopRight
+	case gpucontext.HitTestResizeSW:
+		return htBottomLeft
+	case gpucontext.HitTestResizeSE:
+		return htBottomRight
+	default:
+		return htClient
+	}
 }
 
 // mapWin32PointerType maps Win32 PT_* constants to gpucontext.PointerType.
@@ -1467,8 +1691,122 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		p.queueEvent(Event{Type: EventClose})
 		return 0
 
+	case wmNCUAHDrawCaption, wmNCUAHDrawFrame:
+		// Block undocumented UxTheme caption/frame drawing messages.
+		// These cause border artifacts on frameless windows.
+		// Source: rossy/borderless-window, wangwenx190/framelesshelper
+		p.callbackMu.RLock()
+		frameless := p.frameless
+		p.callbackMu.RUnlock()
+		if frameless {
+			return 0
+		}
+
+	case wmNCActivate:
+		// THE KEY FIX: Prevent non-client area repaint on focus change.
+		// DefWindowProc with lParam=-1 processes activation state change
+		// but SKIPS repainting the non-client area. This eliminates the
+		// visible border flash when the window gains/loses focus.
+		// Source: Chromium, Electron, rossy/borderless-window, FramelessHelper
+		p.callbackMu.RLock()
+		frameless := p.frameless
+		p.callbackMu.RUnlock()
+		if frameless {
+			// Invalidate client area to force GPU redraw over any NC artifacts.
+			procInvalidateRect.Call(uintptr(p.hwnd), 0, 0)
+			return 1
+		}
+
+	case wmNCPaint:
+		// Let DefWindowProc handle WM_NCPAINT — DWM draws shadow + borders.
+		// Our GPU renderer covers the borders. JBR approach.
+
+	case wmNCCalcSize:
+		// JBR approach: remove ONLY the title bar (top NC area).
+		// Keep left/right/bottom NC borders so DWM shadow works.
+		// GPU renderer draws over the thin NC borders.
+		p.callbackMu.RLock()
+		frameless := p.frameless
+		p.callbackMu.RUnlock()
+
+		if frameless && wParam != 0 {
+			// Save original top before DefWindowProc adjusts it
+			rgrc := (*rect)(unsafe.Pointer(lParam)) //nolint:govet // lParam is NCCALCSIZE_PARAMS*
+			frameTop := rgrc.top
+
+			// Let Windows calculate NC area (borders, title bar)
+			procDefWindowProcW.Call(uintptr(hwnd), uintptr(message), wParam, lParam)
+
+			// Restore top — removes title bar but keeps side/bottom borders
+			rgrc.top = frameTop
+
+			if ret, _, _ := procIsZoomed.Call(uintptr(p.hwnd)); ret != 0 {
+				// When maximized, add frame border to top to prevent
+				// window from extending above the screen
+				borderY, _, _ := procGetSystemMetrics.Call(smCYSizeFrame)
+				padded, _, _ := procGetSystemMetrics.Call(smCXPaddedBorder)
+				rgrc.top += int32(borderY + padded)
+			}
+			return 0
+		}
+
+	case wmNCHitTest:
+		// Custom hit testing for frameless windows
+		p.callbackMu.RLock()
+		cb := p.hitTestCallback
+		frameless := p.frameless
+		p.callbackMu.RUnlock()
+
+		if frameless && cb != nil {
+			// Get cursor position in screen coordinates from lParam
+			screenX := int16(lParam & 0xFFFF)
+			screenY := int16((lParam >> 16) & 0xFFFF)
+
+			// Convert screen to client coordinates
+			pt := point{x: int32(screenX), y: int32(screenY)}
+			procScreenToClient.Call(uintptr(p.hwnd), uintptr(unsafe.Pointer(&pt)))
+
+			// Convert to logical (DIP) coordinates
+			scale := p.scaleFactor()
+			logX := float64(pt.x)
+			logY := float64(pt.y)
+			if scale > 1.0 {
+				logX /= scale
+				logY /= scale
+			}
+
+			result := cb(logX, logY)
+			return hitTestResultToWin32(result)
+		}
+
 	case wmWakeUp:
 		// No-op: sole purpose is to unblock MsgWaitForMultipleObjectsEx in WaitEvents.
+		return 0
+
+	case wmDpiChanged:
+		// Window moved to a monitor with different DPI.
+		// lParam points to a RECT with the suggested new position/size.
+		suggestedRect := (*rect)(unsafe.Pointer(lParam)) //nolint:govet // lParam is RECT*
+		procSetWindowPos.Call(uintptr(p.hwnd), 0,
+			uintptr(suggestedRect.left),
+			uintptr(suggestedRect.top),
+			uintptr(suggestedRect.right-suggestedRect.left),
+			uintptr(suggestedRect.bottom-suggestedRect.top),
+			swpNoZOrder|swpNoActivate)
+
+		// Update cached client size after DPI-driven resize.
+		p.updateSize()
+
+		// Queue resize event with new DPI-adjusted dimensions.
+		physW, physH := p.PhysicalSize()
+		logW, logH := p.LogicalSize()
+		p.queueEvent(Event{
+			Type:           EventResize,
+			Width:          logW,
+			Height:         logH,
+			PhysicalWidth:  physW,
+			PhysicalHeight: physH,
+		})
 		return 0
 
 	case wmDestroy:
@@ -1787,6 +2125,7 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 
 	// Left button
 	case wmLButtonDown:
+		p.mouseCapture(wParam)
 		x, y := extractMousePos(lParam)
 		ev := p.createPointerEvent(gpucontext.PointerDown, gpucontext.ButtonLeft, x, y, wParam)
 		p.dispatchPointerEvent(ev)
@@ -1796,10 +2135,12 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		x, y := extractMousePos(lParam)
 		ev := p.createPointerEvent(gpucontext.PointerUp, gpucontext.ButtonLeft, x, y, wParam)
 		p.dispatchPointerEvent(ev)
+		p.mouseRelease(wParam)
 		return 0
 
 	// Right button
 	case wmRButtonDown:
+		p.mouseCapture(wParam)
 		x, y := extractMousePos(lParam)
 		ev := p.createPointerEvent(gpucontext.PointerDown, gpucontext.ButtonRight, x, y, wParam)
 		p.dispatchPointerEvent(ev)
@@ -1809,10 +2150,12 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		x, y := extractMousePos(lParam)
 		ev := p.createPointerEvent(gpucontext.PointerUp, gpucontext.ButtonRight, x, y, wParam)
 		p.dispatchPointerEvent(ev)
+		p.mouseRelease(wParam)
 		return 0
 
 	// Middle button
 	case wmMButtonDown:
+		p.mouseCapture(wParam)
 		x, y := extractMousePos(lParam)
 		ev := p.createPointerEvent(gpucontext.PointerDown, gpucontext.ButtonMiddle, x, y, wParam)
 		p.dispatchPointerEvent(ev)
@@ -1822,10 +2165,12 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		x, y := extractMousePos(lParam)
 		ev := p.createPointerEvent(gpucontext.PointerUp, gpucontext.ButtonMiddle, x, y, wParam)
 		p.dispatchPointerEvent(ev)
+		p.mouseRelease(wParam)
 		return 0
 
 	// X buttons (back/forward)
 	case wmXButtonDown:
+		p.mouseCapture(wParam)
 		x, y := extractMousePos(lParam)
 		button := extractXButton(wParam)
 		ev := p.createPointerEvent(gpucontext.PointerDown, button, x, y, wParam)
@@ -1837,13 +2182,17 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		button := extractXButton(wParam)
 		ev := p.createPointerEvent(gpucontext.PointerUp, button, x, y, wParam)
 		p.dispatchPointerEvent(ev)
+		p.mouseRelease(wParam)
 		return 1 // Must return TRUE for XBUTTON messages
 
 	// Vertical scroll wheel
 	case wmMouseWheel:
 		// For wheel messages, coordinates are screen-relative
-		// We need to convert to client coordinates
-		x, y := extractMousePos(lParam)
+		// Convert to client coordinates using ScreenToClient
+		screenX, screenY := extractMousePos(lParam)
+		pt := point{x: int32(screenX), y: int32(screenY)}
+		procScreenToClient.Call(uintptr(p.hwnd), uintptr(unsafe.Pointer(&pt)))
+		x, y := float64(pt.x), float64(pt.y)
 		deltaY := extractWheelDelta(wParam)
 
 		ev := gpucontext.ScrollEvent{
@@ -1860,7 +2209,12 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 
 	// Horizontal scroll wheel
 	case wmMouseHWheel:
-		x, y := extractMousePos(lParam)
+		// For wheel messages, coordinates are screen-relative
+		// Convert to client coordinates using ScreenToClient
+		screenX, screenY := extractMousePos(lParam)
+		pt := point{x: int32(screenX), y: int32(screenY)}
+		procScreenToClient.Call(uintptr(p.hwnd), uintptr(unsafe.Pointer(&pt)))
+		x, y := float64(pt.x), float64(pt.y)
 		deltaX := extractWheelDelta(wParam)
 
 		ev := gpucontext.ScrollEvent{
